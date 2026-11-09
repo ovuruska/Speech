@@ -35,12 +35,42 @@ if TYPE_CHECKING:
     from vllm_omni.request import OmniRequest
 
 
-def test_mixed_pair_and_conditional_request_complete_independently() -> None:
+@pytest.mark.parametrize("use_cfg", [False, True])
+@pytest.mark.parametrize("probe_value", [False, True])
+def test_removed_pairing_probe_is_rejected_before_cache_admission(use_cfg: bool, probe_value: bool) -> None:
+    """Reject the obsolete diagnostic flag without allocating either history."""
+    scheduler = _mixed_scheduler()
+    free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    request = _request(
+        info={
+            "speaker_id": "eng",
+            "text_tokens": [2, 3],
+            "use_cfg": use_cfg,
+            "_cfg_pairing_probe": probe_value,
+        }
+    )
+    with pytest.raises(ValueError, match="no longer supported"):
+        scheduler.add_request(request)
+    assert not scheduler.requests and not scheduler.cfg_pairs and not scheduler.waiting
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free
+
+
+@pytest.mark.parametrize("use_cfg", [None, False])
+def test_mixed_pair_and_conditional_request_complete_independently(use_cfg: bool | None) -> None:
     """Verify mixed pair and conditional request complete independently."""
     scheduler = _mixed_scheduler()
     free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     scheduler.add_request(_guided("guided"))
-    scheduler.add_request(_plain("plain"))
+    plain = _plain("plain")
+    if use_cfg is not None:
+        from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+
+        info = deserialize_additional_information(plain.additional_information)
+        info["use_cfg"] = use_cfg
+        plain.additional_information = serialize_additional_information(info)
+    scheduler.add_request(plain)
+    assert "plain" not in scheduler.cfg_pairs
+    assert scheduler.vllm_config.model_config.enforce_eager is True
     step = scheduler.schedule()
     assert len(step.num_scheduled_tokens) == 3
     assert step.num_scheduled_tokens["plain"] == 3

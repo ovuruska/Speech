@@ -124,24 +124,11 @@ EASYMAGPIE_LM_PIPELINE = PipelineConfig(
     ),
 )
 
-# Explicit diagnostic topology; never selected by architecture auto-detection.
-# The physical unconditional branch is hidden by both the runner and scheduler.
-EASYMAGPIE_CFG_PAIRING_PIPELINE = replace(
-    EASYMAGPIE_PIPELINE,
-    model_type="easymagpie_cfg_pairing",
-    hf_architectures=(),
-    stages=(
-        replace(
-            EASYMAGPIE_PIPELINE.stages[0],
-            scheduler_cls="easymagpie_vllm_omni.cfg_scheduler.EasyMagpieCFGPairingScheduler",
-        ),
-        EASYMAGPIE_PIPELINE.stages[1],
-    ),
-)
-
+# Explicit CFG topology; never selected by architecture auto-detection.
 EASYMAGPIE_CFG_PIPELINE = replace(
-    EASYMAGPIE_CFG_PAIRING_PIPELINE,
+    EASYMAGPIE_PIPELINE,
     model_type="easymagpie_cfg",
+    hf_architectures=(),
     stages=(
         replace(
             EASYMAGPIE_PIPELINE.stages[0],

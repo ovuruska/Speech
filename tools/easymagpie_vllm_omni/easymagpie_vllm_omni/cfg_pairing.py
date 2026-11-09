@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import ChunkTransferAdapter
 
 CFG_PAIR_METADATA_KEY = "_cfg_pair"
-CFG_PAIRING_PROBE_KEY = "_cfg_pairing_probe"
 _HIDDEN_PREFIX = "__easymagpie_cfg_unconditional__:"
 
 

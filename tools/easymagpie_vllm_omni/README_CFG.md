@@ -2,15 +2,15 @@
 
 For checkpoint conversion, serving-environment setup, and standard synthesis,
 see the [main README](README.md). This guide covers V2 CFG synthesis, cache
-pairing, deployment profiles, CUDA graphs, benchmarks, and validation.
+pairing, the compiled deployment profile, CUDA graphs, benchmarks, and validation.
 
 ### Shared default sampling and per-request fallback
 
 V2 batches using acoustic temperature **0.7**, top-k **80**, and CFG scale
-**2.5** (when CFG is enabled) use the pre-ART sampling recipe: select exactly
+**2.5** (when CFG is enabled) select exactly
 `min(80, vocabulary_size)` logits and draw one FP32 Gumbel tensor for the entire
 frame before iterating through codebooks. Temperature division happens in the
-selected logits' dtype. CFG uses the shared Python scalar 2.5 before sampling;
+selected logits' dtype. CFG uses the shared scalar 2.5 before sampling;
 conditional-only rows bypass guidance. Both branches still consume the public
 branch's sampled feedback.
 
@@ -23,64 +23,29 @@ an eager-execution performance cost. Changing `cfg_scale` while CFG is disabled
 does not affect dispatch or apply guidance. The local-transformer V1 path is
 unchanged.
 
-The default path intentionally changes cutoff-tie behavior (exact-k rather than
-including every tied logit), low-precision sampling arithmetic, and RNG layout.
-Seeded audio can therefore differ from the previous current sampler. Eager CFG
-samples logical prediction rows; graph execution samples the fixed physical
-shape, including private/padded rows, then shares owner results and masks padding.
-Do not expect identical seeded audio across these execution modes or batch shapes.
-Historical validation and throughput figures below precede this change; they do
-not establish serving performance or speech quality for the shared default path.
-
-### V2 CFG cache-pairing diagnostic
-
-The first CFG milestone provides an explicit diagnostic pipeline,
-[`deploy/easymagpie_cfg_pairing.yaml`](deploy/easymagpie_cfg_pairing.yaml).
-It allocates two physical Stage-0 sequences per logical request, each with its
-own backbone attention, Mamba, and temporal acoustic-predictor cache state.
-Both sequences advance together; only the public sequence's output reaches the
-codec or client. Completion and cancellation free both histories.
-
-The cache diagnostic uses the existing conditional inputs on both branches. It accepts the internal
-`additional_information._cfg_pairing_probe: true` marker through direct `AsyncOmni`
-requests. Select the synthesis profile below for `use_cfg: true`, including
-HTTP/WebSocket requests as described below.
-
-In the pinned GPU serving environment, run the completion/abort/reuse smoke test:
-
-```bash
-VLLM_PLUGINS=easymagpie_omni python tools/easymagpie_vllm_omni/scripts/probe_cfg_pairing.py \
-  --model /path/to/converted_v2 --speaker eng
-```
-
-The diagnostic supports one non-resumable known-speaker request at a time,
-eager execution, synchronous scheduling, and disabled prefix caching and chunked
-prefill. Stage-0 capacity counts physical sequences: one logical request needs
-two slots and a token budget covering both prompts. Split scheduling or preemption
-aborts the diagnostic before the worker executes the unsafe step. Use this profile
-for development; it deliberately fails on unsupported scheduling rather than
-recovering or serving other requests concurrently.
-
-The scheduler tests exercise the real vLLM/Omni 0.24 classes and hybrid cache-block
-allocator on CPU. The smoke test additionally requires GPU execution with a V2
-checkpoint; CPU allocation bookkeeping alone does not establish numerical cache
-correctness or audio parity.
+The default path selects exactly k candidates; the per-request sampler includes
+all logits tied at the cutoff. The paths also differ in sampling arithmetic and
+RNG layout. Eager CFG samples logical prediction rows, while graph execution
+samples a fixed physical shape, including private/padded rows, then shares owner
+results and masks padding. Seeded audio can differ across samplers, execution
+modes, and batch shapes.
 
 ### V2 CFG synthesis
 
 [`deploy/easymagpie_cfg.yaml`](deploy/easymagpie_cfg.yaml) adds guided synthesis
-for known-speaker requests with complete text or bounded incremental text. All four synthesis
-profiles (`easymagpie_cfg.yaml`, `_concurrent.yaml`, `_graph.yaml`, and `_compile.yaml`)
-match the standard `easymagpie.yaml` profile's configured capacity for 32 logical CFG requests.
+for known-speaker requests with complete text or bounded incremental text. This is the single
+CFG deployment profile, using a compiled backbone and full decode CUDA graphs. It matches
+the standard `easymagpie.yaml` profile's configured capacity for 32 logical CFG requests.
 Stage 0 has 64 physical slots because each guided request owns two histories; Stage 1 has
 32 slots because only the public branch produces codec input. Guided and
 conditional-only requests use the same explicit pipeline, with `use_cfg` selecting
-whether the scheduler creates a private branch. The pairing-only diagnostic keeps
-its separate single-request scheduler.
+whether the scheduler creates a private branch. Each guided request has separate backbone
+attention, Mamba, and temporal acoustic-predictor cache state for its two branches.
+Completion and cancellation free both histories.
 
 The batching limits account for both physical CFG branches:
 
-| Setting | Standard `easymagpie.yaml` | CFG synthesis profiles |
+| Setting | Standard `easymagpie.yaml` | CFG synthesis profile |
 | --- | --- | --- |
 | Stage-0 `max_num_seqs` | 32 | 64 (32 guided logical requests) |
 | Stage-0 `max_num_batched_tokens` | 4096 | 8192 (both branch spans) |
@@ -96,42 +61,15 @@ configuration. The synchronous, unchunked CFG restriction remains in force. Thus
 and the Stage-0 logical token budget match the baseline, while those execution/history requirements
 remain explicit differences. Cache availability and the request bound can reduce achieved admission.
 
-**The expanded compiled profile passed GPU batching validation on 2026-11-03.**
-Diagnostics observed Stage-0 decode and FULL graph replay with 32 logical CFG requests
-at client concurrency 32 and 64. Separate uninstrumented HTTP and incremental timing
-phases at c1/2/4/8/16/32/64 completed 1,792/1,792 measured requests, plus 28/28 reuse
-checks, with PCM/ID audits and health checks. Validation used one registered speaker
-on an RTX 5880 Ada with Torch 2.11.0+cu130 and vLLM/vLLM-Omni 0.24.0. These checks
-precede the subsequent nonblocking input-completion and late-sentinel cleanup fixes.
-Focused compiled GPU revalidation on 2026-11-03 passed full-queue completion with
-coalescing enabled/disabled, delayed-input completion/cancellation/reuse, and reuse
-after a deliberately shortened-watchdog timeout. All 13 HTTP/WebSocket acceptance
-cases and four additional reuse requests passed with PCM/ID and health checks.
-The induced timeout checks error cleanup; it does not establish behavior under a
-naturally occurring 67-second timeout or repeat the c1–c64 timing measurements.
+Raw reference/user audio, retained turns, preemption, asynchronous scheduling,
+chunked prefill, and prefix caching remain unsupported in this CFG path.
+Scale 1 numerical parity with conditional-only greedy inference is not established.
 
-c64 is queued client load above 32 active logical slots. Substantial simulated playback
-underruns occurred at c32/c64; c32 HTTP timing also included batch-kernel JIT despite
-c1 warmups. Successful completion and PCM/ID audits do not establish text fidelity,
-numerical parity or uninterrupted playback. The eager and decode-only graph profiles
-have not independently received this expanded-capacity validation. Historical
-single-request benchmarks below used two physical Stage-0 slots and one codec slot;
-the pairing-only diagnostic remains at two slots.
-
-The corrected profile passed the GPU completion/abort/reuse probe at CFG 2.5,
-acoustic temperature 0.7, top-k 80 before the mixed-admission extension. Mixed
-concurrency also passed the mixed GPU cancellation/reuse probe;
-see the profile and probe below. Raw reference/user audio,
-retained turns, preemption, asynchronous scheduling, chunked prefill,
-and prefix caching remain unsupported in this CFG path. The default profiles keep CUDA graphs
-disabled; an experimental decode-only graph profile is described below. Scale 1 did not match
-conditional-only greedy inference on the tested prompt; numerical parity remains open.
-
-Re-run checkpoint conversion before using CFG. V2 conversion now exports
-`cfg_context_embedding` using the exact one-token context CAS setting from NeMo,
-the `cfg_unk_token_id`, and versioned `cfg_capability` metadata. Older artifacts
-remain usable for conditional synthesis; CFG rejects them with a reconversion error.
-An advertised capability with missing or malformed embedding weights fails loading.
+CFG requires a V2 checkpoint converted with
+`cfg_context_embedding`, `cfg_unk_token_id`, and versioned `cfg_capability` metadata.
+The embedding uses NeMo's one-token context CAS setting. Checkpoints without this
+metadata support conditional synthesis but require reconversion for CFG. Missing
+or malformed embedding weights fail loading when CFG capability is advertised.
 
 For direct `AsyncOmni` calls, load plugins before constructing the engine so the
 custom pipeline is registered when Omni resolves the deployment:
@@ -150,7 +88,8 @@ prompt["additional_information"].update(use_cfg=True, cfg_scale=2.5, temperature
 The serving default is 2.5, matching NeMo's high-level inference default (the
 low-level streaming API defaults to 1.0). Acoustic temperature is finite, with
 values at or below zero selecting actual greedy argmax. `top_k` is a positive
-integer and retains all logits tied at the kth cutoff. V2 acoustic sampling settings
+integer. The default sampler selects exactly k logits; the per-request fallback retains
+all logits tied at the kth cutoff. V2 acoustic sampling settings
 belong to each request and do not affect the engine's dummy continue/stop sampler.
 
 Both branches advance their own temporal caches. The unconditional branch uses
@@ -158,16 +97,9 @@ CFG_UNK across the full task/speaker/context span, zeros during target warmup,
 and shared audio inputs during decode. Phonemes come from the conditional branch.
 Each predictor block combines logits before sanitization and sampling, then feeds
 the one sampled code into both branches. Only one logical code stream reaches the codec.
-The CFG profiles reserve 2048 positions for the codec's cumulative prompt history,
+The CFG profile reserves 2048 positions for the codec's cumulative prompt history,
 matching the Stage-0 generation budget. Keep those capacities aligned when raising
 `max_tokens`; a small codec chunk size does not bound accumulated prompt history.
-
-Run the same completion/abort/reuse check at the default acoustic settings:
-
-```bash
-VLLM_PLUGINS=easymagpie_omni python tools/easymagpie_vllm_omni/scripts/probe_cfg_pairing.py \
-  --model /path/to/reconverted_v2 --speaker eng --use-cfg --cfg-scale 2.5 --temperature 0.7
-```
 
 CPU tests cover export semantics, metadata/weight validation, branch inputs,
 logit guidance, cutoff/greedy sampling, shared feedback, and engine bookkeeping.
@@ -175,8 +107,7 @@ They do not establish waveform quality, numerical cache parity, or measured CFG 
 
 ### Precision shared with standard serving
 
-All CFG profiles, including the pairing diagnostic and experimental graph profile,
-use the same precision settings as `deploy/easymagpie.yaml` and `deploy/easymagpie_lm.yaml`:
+The CFG profile uses the same precision settings as `deploy/easymagpie.yaml` and `deploy/easymagpie_lm.yaml`:
 
 | Component | Deployment dtype |
 | --- | --- |
@@ -190,56 +121,39 @@ intermediate arithmetic remain intentional; model weights and embeddings follow
 the configured model dtype. Integer code/index buffers and boolean masks retain
 their existing types.
 
-Earlier registered-speaker V2 CFG listening/acceptance used BF16 talker execution
-to match the reference inference setup.
-BF16 is not required by CFG or CUDA graphs. The profiles now use FP16 for consistency
-with standard serving; those historical results do not validate the new FP16 runtime.
-FP16 GPU lifecycle and frontend checks have since passed, and the LibriTTS benchmarks
-below use FP16. The user accepted the selected post-fix FP16 listening samples.
+Checkpoint storage dtype is independent of serving dtype. A BF16 export is cast
+to FP16 when loaded with the supplied profile. BF16 is not required for CFG or
+CUDA graphs. The benchmark results below use FP16 talker execution.
 
-### Experimental V2 CFG decode graphs
+### Compiled backbone prefill and decode graphs
 
-`deploy/easymagpie_cfg_graph.yaml` opts into Stage-0 `FULL_DECODE_ONLY` CUDA
-capture without `torch.compile` (`compilation_config.mode: 0`). It keeps the same
-FP16 talker, FP32 Mamba SSM cache, 64 physical talker slots, synchronous scheduling,
-and eager FP32 codec as `easymagpie_cfg.yaml`. Prefill remains eager. Existing eager profiles remain the
-default and provide the fallback by selecting their deployment YAML on restart.
+[`deploy/easymagpie_cfg.yaml`](deploy/easymagpie_cfg.yaml) enables
+`torch.compile` for the Nemotron-H backbone (`compilation_config.mode: 3`,
+`VLLM_COMPILE`) and selects `FULL_AND_PIECEWISE` CUDA graphs. It uses the standard
+non-CFG profile's backbone optimization policy with synchronous, unchunked paired
+scheduling and separate branch caches. During prefill, the outer
+EasyMagpie logic and V2 acoustic-predictor cache advancement stay eager; eligible
+backbone regions use piecewise graphs, with attention and Mamba operations outside
+those graph regions. Decode retains full graph capture and the same persistent
+pairing buffers. The codec remains eager FP32.
 
-**The zero-audio completion race is fixed and post-fix GPU revalidation passed.**
-On 2026-10-30, the pinned FP16 runtime passed graph streaming completion/cancellation/reuse,
-mixed CFG/conditional traffic, and actual replay validation at the preceding smaller capacities (169 GPU graph replays across
-four captured shapes). Those checks preceded the completion fix. After the fix, an
-uninstrumented graph run passed all 13 HTTP/WebSocket acceptance cases and 80 alternating
-CFG/conditional requests. The final text-input sentinel now leaves the codec live until
-its ordered terminal connector payload is consumed; frontend completion waits for the
-selected output stages to acknowledge termination. This prevents zero audio and truncated
-tails when the codec lags behind the talker.
+Fully eager Stage-0 execution remains supported by setting `enforce_eager: true`
+and disabling backbone compilation (`compilation_config.mode: 0`) and CUDA graphs
+(`compilation_config.cudagraph_mode: NONE`) in a deployment configuration. Decode-only
+graph execution also remains supported with mode 0 and `FULL_DECODE_ONLY` when
+`enforce_eager: false`. These execution options use the same CFG scheduler.
+Custom sampling settings retain the automatic eager fallback described above.
 
-After GPU access recovered, the full serving suite passed **323 tests / 1 intentional
-CI-only skip**, including CUDA replay and packed codec. Default graph lifecycle and
-six-slot mixed pressure probes passed again after the fix, including acoustic tails,
-waiting cancellation, and reuse. Keep the profile experimental: the benchmark comparison
-below covers 100 LibriTTS texts with one registered speaker at concurrency one, and
-long outputs still need stopping/repetition review.
-The separate pairing-only diagnostic still requires eager execution. The CFG scheduler
-also accepts the experimental compiled-backbone profile below; other graph and compilation
-combinations are rejected.
-
-To try the experimental profile after verifying GPU access, use the existing model
-and [serving environment](README.md#setup-the-serving-environment):
+The profile captures physical token counts up to 512, including both branches'
+prefill spans, with padding to a configured capture size. Larger prefills use the
+compiled backbone without CUDA graph replay. This capture limit is separate from
+the request's output-token bound. Full decode capture covers physical batch sizes
+through 64 rows, including both branches of all 32 guided logical requests.
 
 ```bash
-EASYMAGPIE_DEPLOY_CONFIG=tools/easymagpie_vllm_omni/deploy/easymagpie_cfg_graph.yaml \
+EASYMAGPIE_DEPLOY_CONFIG=tools/easymagpie_vllm_omni/deploy/easymagpie_cfg.yaml \
   bash tools/easymagpie_vllm_omni/scripts/run_server.sh /path/to/converted_v2 8091
 ```
-
-Check startup logs for actual decode graph capture; a successful server launch or
-`enforce_eager: false` alone is insufficient evidence of replay. Run lifecycle and
-incremental-text probes, including cancellation/reuse, before relying on this profile.
-For a direct incremental lifecycle probe, select it with `probe_cfg_streaming.py
---deploy-config tools/easymagpie_vllm_omni/deploy/easymagpie_cfg_graph.yaml` (plus
-`--model` and `--speaker`). Mixed pressure needs a profile with sufficient physical
-slots and capture sizes; the current graph profile captures decode batches through 64 physical rows.
 
 The runner stages owner/partner indices and padding masks into persistent GPU buffers
 after request reordering. Captured predictor operations use fixed physical batch
@@ -250,171 +164,126 @@ Custom-settings batches retain tensor-valued greedy argmax semantics in the eage
 fallback; the tensor sampler may consume unused random draws. CFG scale,
 temperature, and top-k remain runtime tensor inputs for those batches.
 Default-settings graphs capture the shared constants described above.
-Checkpoint storage dtype is separate from deployment dtype; an existing BF16
-artifact is cast to FP16 on loading.
-Recasting a saved BF16 artifact cannot recover precision lost in its earlier conversion.
 
-Compare eager and graph deployments using identical artifacts, FP16 runtime settings,
-warmups, and traffic, without a profiler. Account for generated frame counts and
-actual audio duration as well as latency. Report startup/capture cost and GPU memory
-separately; do not infer a speedup from graph enablement alone.
+Check startup logs for actual graph capture; a successful server launch alone is
+insufficient evidence of replay. Report compilation/capture startup costs separately
+from warmed-up request timings.
 
-### LibriTTS 100 benchmark results
+Tests cover configuration guards, dispatch to piecewise prefill/full decode,
+fallback beyond the capture range, and cache/graph contracts. CPU tests do not
+establish actual GPU replay, waveform quality, or performance.
 
-Completed 2026-10-30 on the same 100 LibriTTS texts. Each of the four benchmarks
-completed **100 successful measured requests with zero failures**, plus one
-excluded warmup. All 200 CFG WAVs passed format, ID, nonempty, and nonzero checks.
+### Benchmarks
 
-Both modes used the same server command and byte-identical text files, the existing
-`demon` model/speaker, `deploy/easymagpie_cfg_graph.yaml`, FP16 talker, FP32 Mamba
-SSM cache/codec, concurrency one, 32 kHz PCM, and a maximum of 512 output tokens.
-CFG requests used scale 2.5, acoustic temperature 0.7, and top-k 80. Incremental
-input used five tokens per chunk with zero send delay. Script hash checks passed.
-The conditional baseline used this same CFG graph pipeline with CFG disabled.
-These results compare CFG and conditional synthesis on the decode-only graph
-profile; they do not measure the compiled-prefill profile described below.
+The benchmark covers 10 configurations across 11 runs, including a legacy HTTP c32
+repeat, with **1,100/1,100 successful measured requests**. Legacy incremental c1/c32
+are excluded because of a prefill-boundary engine bug. An incomplete CFG HTTP c32
+attempt stopped before reuse and is excluded from the tables.
 
-Throughput is generated audio seconds divided by benchmark batch wall seconds
-(RTF), including batch/process-pool overhead and excluding warmup; higher is faster.
+#### Setup and measurement
 
-| Metric | Conditional HTTP | CFG HTTP | Conditional incremental | CFG incremental |
-| --- | ---: | ---: | ---: | ---: |
-| Throughput, times realtime | 8.64x | 6.64x | 8.56x | 7.10x |
-| CFG throughput decrease | — | **23.15%** | — | **17.06%** |
-| Mean TTFA, ms | 155.9 | 160.8 | 166.9 | 174.7 |
-| p95 TTFA, ms | 194.4 | 188.3 | 193.6 | 205.0 |
-| Mean latency, s | 1.14 | 0.68 | 0.94 | 0.68 |
-| p95 latency, s | 3.63 | 1.57 | 1.88 | 1.10 |
-| Total generated audio, s | 985.76 | 451.36 | 811.60 | 481.44 |
-| Batch wall, s | 114.12 | 68.00 | 94.76 | 67.85 |
-| Cumulative playback underruns | 0 | 0 | 0 | 0 |
-| Outputs at least 40 s | 3 | 0 | 2 | 1 |
+- Legacy source: `fa1009753cc353702ae0ac701b2aab10d7d4136a`;
+  current non-CFG and CFG: `2c69a87f2dbc083af91bc39df2a7ad75846ea11b`.
+  Results apply to these revisions; subsequent source changes have not been
+  benchmarked here.
+- GPU0: NVIDIA RTX 5880 Ada Generation, 49,140 MiB. Python 3.12,
+  torch 2.11.0+cu130, vLLM/vLLM-Omni 0.24.0. BF16 exports, FP16 talker,
+  FP32 SSM cache, eager FP32 codec.
+- Same 100 texts/IDs and registered speaker `test_voice_01`, prepared from the
+  first five seconds of `test_voice_01.wav`. Temperature 0.7, top-k 80, CFG scale 2.5,
+  max 512 new tokens, client ordering seed 0, mono PCM16 at 32 kHz.
+- HTTP supplies complete text. WS supplies five text tokens per chunk with zero
+  intentional delay; it does not simulate paced human input.
+- Each invocation uses fresh isolated compiler caches and a startup compilation
+  gate, then a new case server, 2 c1 smoke requests, 100 excluded warmups at the
+  selected concurrency, 100 measured requests, and 2 c1 reuse requests.
+  Startup, compilation, smoke, warmup, and reuse are excluded from measured wall time.
+- Non-CFG uses the standard asynchronous/chunked profile; CFG uses synchronous,
+  unchunked scheduling. Slot counts and token/cache budgets differ as shown above.
+  This compares complete deployments, not guidance alone or conditional requests
+  within the CFG deployment.
 
-Percentage decreases use the printed RTF values:
-`(conditional RTF − CFG RTF) / conditional RTF × 100`.
-Mean time to first audio (TTFA) increased by **4.9 ms** over HTTP and **7.8 ms**
-over incremental input. CFG generated 54.2% less audio over HTTP and 40.7% less
-over incremental input, so shorter request latency does not establish faster
-synthesis. These are single runs with stochastic outputs and independently
-randomized request order; output-length differences and suspected repetition
-limit a controlled performance comparison.
+#### Throughput and latency
 
-One CFG incremental output, `237_126133_000051_000002.wav`, lasted **40.64 s**.
-The conditional baseline had five similarly long outputs. These need listening
-for repetition/stopping issues; duration alone does not confirm a bound hit.
-Clients did not save per-request stop metadata or elapsed times, so filtered RTF
-is unavailable. All outputs remain included in throughput. No listening or
-text-fidelity pass is claimed for this workload.
+Each row contains 100/100 successful measured requests. **Audio/wall** is generated
+audio seconds divided by client wall seconds (higher is better); conventional
+**RTF** is wall/audio (lower is better). The client's field named `rtf` actually
+reports audio/wall. TTFA includes queueing, latency ends at stream completion,
+and ITL is the interval between received audio chunks. Values are mean/p95.
 
-The local source report is `work/cfg_benchmark_report.md`; detailed results and
-audio audits are under `work/cfg_graph_validation/legacy_cfg_libritts_100_02/`
-and `work/cfg_graph_validation/legacy_libritts_100_02/`. These evidence files are
-Git-ignored workspace artifacts.
+| Configuration | Audio s | Wall s | Requests/s | Audio/wall | RTF | TTFA mean/p95 ms | Latency mean/p95 s | ITL mean/p95 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Legacy HTTP c1 | 788.56 | 80.161 | 1.2475 | 9.8372× | 0.10165 | 155.9/191.1 | 0.799/1.483 | 52.0/68.0 |
+| Legacy HTTP c32 | 745.60 | 17.200 | 5.8139 | 43.3484× | 0.02307 | 639.1/917.1 | 4.944/9.553 | 371.9/581.9 |
+| Legacy HTTP c32 repeat | 766.40 | 18.087 | 5.5288 | 42.3724× | 0.02360 | 851.3/1259.8 | 5.124/10.536 | 357.4/543.5 |
+| Current HTTP c1 | 788.72 | 80.963 | 1.2351 | 9.7417× | 0.10265 | 156.5/190.5 | 0.807/1.598 | 52.8/69.0 |
+| Current HTTP c32 | 774.24 | 18.380 | 5.4408 | 42.1251× | 0.02374 | 628.0/848.5 | 5.311/10.101 | 388.9/609.3 |
+| Current WS c1 | 755.28 | 79.493 | 1.2580 | 9.5013× | 0.10525 | 166.5/198.0 | 0.792/1.505 | 53.0/72.0 |
+| Current WS c32 | 750.40 | 18.215 | 5.4900 | 41.1973× | 0.02427 | 895.7/1648.6 | 5.184/8.162 | 365.5/614.2 |
+| CFG HTTP c1 | 637.76 | 74.428 | 1.3436 | 8.5689× | 0.11670 | 142.7/167.3 | 0.742/1.336 | 60.4/78.7 |
+| CFG HTTP c32 | 627.12 | 19.223 | 5.2020 | 32.6228× | 0.03065 | 953.3/1372.9 | 5.576/11.062 | 475.4/716.4 |
+| CFG WS c1 | 602.24 | 75.415 | 1.3260 | 7.9857× | 0.12522 | 154.6/190.6 | 0.752/1.376 | 63.5/81.4 |
+| CFG WS c32 | 614.32 | 19.156 | 5.2203 | 32.0696× | 0.03118 | 847.3/1195.5 | 5.482/9.363 | 473.7/717.8 |
 
-### Experimental compiled backbone prefill
+Current non-CFG HTTP audio throughput is 0.97% below legacy at c1, and 2.82% below
+the first legacy c32 run or 0.58% below its repeat. Both legacy c32 observations
+are shown separately; the repeat includes compiler activity. The observed differences
+are descriptive, without confidence intervals or a controlled regression estimate.
 
-[`deploy/easymagpie_cfg_compile.yaml`](deploy/easymagpie_cfg_compile.yaml) adds
-`torch.compile` for the Nemotron-H backbone (`compilation_config.mode: 3`,
-`VLLM_COMPILE`) and selects `FULL_AND_PIECEWISE` CUDA graphs. This restores the
-standard non-CFG profile's backbone optimization policy while retaining synchronous,
-unchunked paired scheduling and separate branch caches. During prefill, the outer
-EasyMagpie logic and V2 acoustic-predictor cache advancement stay eager; eligible
-backbone regions use piecewise graphs, with attention and Mamba operations outside
-those graph regions. Decode retains full graph capture and the same persistent
-pairing buffers. The codec remains eager FP32.
+Relative to current non-CFG, CFG audio throughput is 12.04%/15.95% lower at c1
+HTTP/WS and 22.56%/22.16% lower at c32 HTTP/WS. CFG generates 18–20% less total
+audio, which contributes to its higher requests/s at c1. Since the generated outputs
+differ, these ratios do not measure equal-output inference speed or speech quality.
 
-The profile captures physical token counts up to 512, including both branches'
-prefill spans, with padding to a configured capture size. Larger prefills use the
-compiled backbone without CUDA graph replay. This capture limit is separate from
-the request's output-token bound. Model precision, cache limits, and the 64-slot
-capacity match the decode-only graph profile.
+#### Playback and measured compilation
 
-```bash
-EASYMAGPIE_DEPLOY_CONFIG=tools/easymagpie_vllm_omni/deploy/easymagpie_cfg_compile.yaml \
-  bash tools/easymagpie_vllm_omni/scripts/run_server.sh /path/to/converted_v2 8091
-```
+An underrun estimates playback-buffer exhaustion when playback starts on first
+audio. A deadline miss is a gap exceeding the preceding chunk's audio duration;
+previously buffered audio can cover it. These are playback estimates, not failed
+synthesis requests. Affected requests count streams with at least one underrun.
 
-Tests check the opt-in guards, real vLLM dispatch to piecewise prefill/full
-decode, fallback beyond the capture range, and profile/cache contracts. On
-2026-10-31, the restored runtime passed all 124 selected CFG/profile tests,
-including the six previously skipped CUDA cases. The compiled profile passed all
-13 HTTP/WebSocket acceptance cases and the separate streaming completion,
-waiting-cancellation, and reuse probe. Completed streams produced acoustic tails
-and finished codec output. A validation-only worker recorded **54 actual PIECEWISE
-backbone replays** at 256 physical tokens and **78 FULL decode replays** at two
-physical tokens, with paired request IDs; this instrumentation was excluded from
-the benchmark timings below.
+| Configuration | Underruns | Requests affected / 100 | Deadline misses | Measured compiler/cache activity |
+| --- | ---: | ---: | ---: | --- |
+| Legacy HTTP c1 | 0 | 0 | 0 | None observed |
+| Legacy HTTP c32 | 15 | 11 | 59 | None observed |
+| Legacy HTTP c32 repeat | 3 | 3 | 21 | 16 files; 2 fused-MoE specializations |
+| Current HTTP c1 | 0 | 0 | 0 | None observed |
+| Current HTTP c32 | 27 | 20 | 74 | None observed |
+| Current WS c1 | 0 | 0 | 0 | None observed |
+| Current WS c32 | 17 | 14 | 84 | 160 files; 18 gather + 2 fused-MoE specializations |
+| CFG HTTP c1 | 0 | 0 | 0 | None observed |
+| CFG HTTP c32 | 114 | 58 | 260 | 16 files; 2 fused-MoE specializations |
+| CFG WS c1 | 0 | 0 | 0 | None observed |
+| CFG WS c32 | 94 | 76 | 166 | 104 files; 13 gather specializations |
 
-Keep this profile experimental: the replay measurements above cover one registered speaker and the
-former two-slot profile. Later expanded-capacity validation is summarized in the V2 CFG synthesis
-section; it does not establish listening/text fidelity or numerical parity across batch sizes.
-Re-run acceptance and lifecycle checks with your model before relying on it.
-Compilation adds startup cost; the measured TTFA improvement below does not
-establish equal-output synthesis speed or quality.
+All c1 rows have zero playback gaps. Every c32 row has underruns; CFG affects
+58/100 HTTP and 76/100 WS requests. Client concurrency must account for playback
+latency as well as aggregate throughput; the maximum gap-free concurrency was not measured.
 
-### CFG comparison with 100 warmup requests
+Cache snapshots show additional compiled specializations in four runs after the
+fixed warmup. Their timings include compilation overhead and should not be treated
+as steady-state measurements. The other seven runs show no measured cache activity.
+No run logged a measured JIT warning or detected compiler processes at phase
+boundaries, so logs and boundary checks alone are insufficient to detect compilation.
+The compilation cost cannot be separated from the recorded timings.
 
-Completed 2026-10-31. This additional comparison preserves the earlier results above.
-Each protocol/profile uses **100 excluded warmup requests followed by 100 measured
-requests**. Both profiles passed all 400 synthesis requests
-and all 13 HTTP/WebSocket acceptance cases. The compiled run completed after
-GPU access recovered; the earlier blocked preflight remains preserved.
+#### Startup, memory, and validation limits
 
-A fresh conversion uses the same source checkpoint, five seconds of
-`demon_voice_01.wav`, and registered speaker `demon`, saved under
-`work/demon_cfg_reconverted_20261031/model`. Its weights, codec, and tokenizer
-match the historical artifact byte for byte; the speaker tensor is also identical.
-Storage remains BF16, with FP16 talker execution and FP32 SSM cache/codec.
-Both profiles use the same 100-text TSV and unchanged CFG benchmark scripts,
-CFG 2.5 / temperature 0.7 / top-k 80, concurrency one, 512 output tokens,
-and 32 kHz PCM. Incremental input uses five tokens per chunk and zero send delay.
-All columns below use CFG. RTF is audio seconds / batch wall seconds, including
-process-pool overhead and excluding warmup; higher is faster.
+CFG fresh-cache startup to health took 279.32–281.57 s; measurement-server startup
+using those caches took 87.81–89.83 s. These are separate startup wall times,
+not pure compiler timings or part of request throughput.
 
-| Metric | Decode-only HTTP | Compiled HTTP | Decode-only incremental | Compiled incremental |
-| --- | ---: | ---: | ---: | ---: |
-| Warmup successful / failed | 100 / 0 | 100 / 0 | 100 / 0 | 100 / 0 |
-| Measured successful / failed | 100 / 0 | 100 / 0 | 100 / 0 | 100 / 0 |
-| Throughput, times realtime | 7.70x | 7.75x | 7.14x | 7.26x |
-| Mean TTFA, ms | 161.1 | 149.8 | 176.4 | 165.7 |
-| p95 TTFA, ms | 196.3 | 179.6 | 209.0 | 195.3 |
-| Mean latency, s | 0.65 | 0.81 | 0.72 | 0.84 |
-| p95 latency, s | 1.19 | 1.50 | 1.23 | 1.50 |
-| Total generated audio, s | 504.08 | 633.28 | 512.88 | 612.64 |
-| Batch wall, s | 65.48 | 81.68 | 71.87 | 84.39 |
-| Cumulative playback underruns | 0 | 0 | 0 | 0 |
-| Outputs at least 40 s | 0 | 0 | 1 | 0 |
+GPU memory was sampled every 15 seconds across whole server lifetimes. CFG case
+maxima were 26,549–30,631 MiB; earlier CFG compilation gates reached 47,049 MiB.
+These are sampled observations, not instantaneous peaks or minimum requirements.
+The lower CFG case memory is confounded by codec cache budgets: a recorded
+non-CFG/CFG pair used 12.40/1.03 GiB. It does not establish lower intrinsic CFG memory.
 
-Compiled mean TTFA fell by 11.3 ms (7.0%) over HTTP and 10.7 ms (6.1%) over
-incremental input. Recomputed throughput increased by 0.7% and 1.7%, respectively.
-Generated audio increased by 25.6% and 19.5%, and mean request latency increased;
-these single stochastic runs do not establish equal-output synthesis speed or quality.
-
-Decode-only service startup to health took 184.16 s; graph capture reported
-4 s / 0.07 GiB. Compiled startup took 235.17 s, including 12.78 s of backbone
-compilation; graph capture reported 9 s / 0.17 GiB. GPU 0 used 26,219 / 26,221 MiB
-at readiness, with sampled startup peaks of 47,584.56 / 47,586.56 MiB, respectively.
-Observed compiled inference settled near 26,907 MiB (26.28 GiB); its monitoring
-covered the full run without errors. These allocations are not minimum hardware
-requirements. The decode-only run lost NVML monitoring late in inference, after
-which the first compiled preflight failed. The resumed compiled run reported no OOM.
-
-All 200 measured and 200 warmup WAVs per profile passed format, ID, nonempty,
-and nonzero checks. The longest compiled measured outputs were 13.04 s (HTTP)
-and 13.12 s (incremental). One decode-only measured incremental output,
-`908_157963_000010_000001.wav`, lasted 40.64 s and needs listening for
-repetition/stopping; duration does not establish a bound hit. It remains included
-in RTF. Output sampling and request order are stochastic, and the earlier table
-used only one warmup per protocol, so differences from historical numbers do not
-isolate a warmup benefit or establish audio quality. Listening/text-fidelity
-acceptance remains pending for the compiled outputs.
-
-Report: `work/cfg_compiled_benchmark_report.md`. Logs, commands, WAVs, configuration,
-memory samples, and audits are in
-`work/cfg_graph_validation/fresh_decode_cfg_libritts_100_warm100_01/` and
-`work/cfg_graph_validation/fresh_compiled_cfg_libritts_100_warm100_02/`.
-The earlier blocked compiled preflight remains in the `_01` directory.
-These are Git-ignored workspace artifacts.
+Validation recomputed metrics and checked request IDs, PCM format, frame counts,
+and chunk durations for all 2,244 WAVs across smoke, warmup, measured, and reuse
+phases. Each included run passed readiness, integrity, postflight, and cleanup
+checks. Two 40.80-second c1 outputs remain in the totals without filtering.
+Speech intelligibility, speaker similarity, and stopping quality were not evaluated.
 
 ### CFG benchmark scripts
 
@@ -434,22 +303,22 @@ Start a server with a CFG deployment as described below, then run:
 
 ```bash
 python tools/easymagpie_vllm_omni/scripts/benchmark_server_cfg.py \
-  --text-file texts.tsv -n 100 --speaker-id demon --output-dir cfg_http_audio
+  --text-file texts.tsv -n 100 --speaker-id test_voice_01 --output-dir cfg_http_audio
 
 PYTHONPATH=tools/easymagpie_vllm_omni \
 python tools/easymagpie_vllm_omni/scripts/benchmark_incremental_server_cfg.py \
   --model /path/to/reconverted_v2 --text-file texts.tsv -n 100 \
-  --speaker-id demon --tokens-per-chunk 5 --send-delay-ms 0 \
+  --speaker-id test_voice_01 --tokens-per-chunk 5 --send-delay-ms 0 \
   --output-dir cfg_incremental_audio
 ```
 
-Choose a speaker registered in your converted model (`demon` is an example).
+Choose a speaker registered in your converted model (`test_voice_01` in these examples).
 Override sampling with `--cfg-scale`, `--temperature`, and `--top-k`; use
 `--no-use-cfg` for conditional inference with the same sampling settings.
 Nonpositive temperature selects greedy decoding. Guided requests require a CFG
 pipeline and registered speaker; HTTP `--reference-audio` requires `--no-use-cfg`.
-The single-request graph/eager CFG profiles support the default concurrency one;
-use the concurrent deployment and its documented capacity for higher concurrency.
+Use `--concurrency` to change client load. The same CFG deployment supports up to
+32 active guided logical requests, subject to cache availability; excess load queues.
 The 512-token bound includes stream warmup, EOS, and acoustic tail, so inspect long
 outputs for repetition or truncation before interpreting throughput as quality.
 These clients do not persist per-request frame counts or stop reasons.
@@ -469,7 +338,7 @@ For complete text, send acoustic settings in `extra_params`:
 ```bash
 curl http://localhost:8091/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"input":"Hello from the speech server.","voice":"eng","response_format":"wav",
+  -d '{"input":"Hello from the speech server.","voice":"test_voice_01","response_format":"wav",
        "extra_params":{"use_cfg":true,"cfg_scale":2.5,"temperature":0.7,"top_k":80}}' \
   --output speech.wav
 ```
@@ -479,7 +348,7 @@ and send these JSON messages in order. Receive binary PCM audio concurrently
 with sending text; completion is reported by `audio.done` and `session.done`.
 
 ```json
-{"type":"session.config","voice":"eng","stream_audio":true,"response_format":"pcm","max_new_tokens":512,"extra_params":{"use_cfg":true,"cfg_scale":2.5,"temperature":0.7,"top_k":80}}
+{"type":"session.config","voice":"test_voice_01","stream_audio":true,"response_format":"pcm","max_new_tokens":512,"extra_params":{"use_cfg":true,"cfg_scale":2.5,"temperature":0.7,"top_k":80}}
 {"type":"input.text","text":"Hello from "}
 {"type":"input.text","text":"the speech server."}
 {"type":"input.done"}
@@ -493,7 +362,7 @@ positive integer. Nonpositive temperature selects greedy acoustic decoding; scal
 zero and one are supported. These are acoustic settings, separate from the engine's
 dummy-token sampling settings.
 
-Guided requests require the `easymagpie_cfg` pipeline (either CFG deployment profile),
+Guided requests require the `easymagpie_cfg` pipeline,
 valid V2 capability metadata, and a registered speaker. Unsupported deployments,
 older artifacts, and raw-reference CFG requests are rejected before generation.
 Incremental sessions require registered speakers for conditional-only inference too.
@@ -501,17 +370,12 @@ On the CFG pipeline, `max_new_tokens` bounds the whole stream, including text wa
 EOS, and acoustic tail, for guided and conditional requests. The bound must fit the
 deployment's cache and codec capacities. Settings are fixed for the session.
 
-Live GPU acceptance passed complete-text HTTP and incremental WebSocket synthesis
-for guided and conditional requests, invalid-setting and unsupported-profile rejection,
-and disconnect after audio delivery followed by successful reuse. These smoke checks
-do not establish speech quality, numerical parity, throughput, or long-run leak freedom.
-
 ### Incremental text with paired V2 CFG
 
 Use the direct `AsyncOmni.generate()` streaming-input API with the explicit
 `easymagpie_cfg` pipeline and a registered speaker. Speaker embeddings must be
-prepared offline with the served checkpoint. The pairing-only diagnostic still
-rejects streaming. HTTP/WebSocket clients can select CFG through `extra_params` as described above.
+prepared offline with the served checkpoint. HTTP/WebSocket clients can select CFG
+through `extra_params` as described above.
 
 [`EasyMagpieInputStream`](easymagpie_vllm_omni/serving_stream.py) builds the input
 iterator, buffers the initial text warmup, assigns absolute `text_token_start`
@@ -528,7 +392,7 @@ The stream's `max_new_tokens` becomes the immutable `max_stream_tokens` request
 bound. It covers the sum of all segment generation limits, including warmup, text
 EOS, and tail; it is not a per-chunk limit. The initial prompt plus that bound must
 fit Stage 0's `max_model_len`, and the codec history must cover the bound (2048 in
-the supplied profiles). Text that leaves no room for EOS/tail is rejected. Use
+the supplied profile). Text that leaves no room for EOS/tail is rejected. Use
 the checkpoint's phoneme-BOS warmup; a too-short initial text input cannot start
 generation. Requests keep their original CFG mode, scale, speaker, and acoustic
 sampling settings throughout the stream.
@@ -541,26 +405,13 @@ and text after the acoustic tail are rejected. Only the public branch reaches th
 codec and frontend. Text chunks belong to one synthesis request; retained dialogue
 turns and request-time audio conditioning are outside this contract.
 
-Run a delayed-chunk completion, cancellation-while-waiting, and reuse probe:
+### Mixed CFG/conditional admission
 
-```bash
-VLLM_PLUGINS=easymagpie_omni python tools/easymagpie_vllm_omni/scripts/probe_cfg_streaming.py \
-  --model /path/to/reconverted_v2 --speaker eng --output /tmp/cfg-streaming.json
-```
-
-Add `--mixed --deploy-config tools/easymagpie_vllm_omni/deploy/easymagpie_cfg_concurrent.yaml`
-to test streaming CFG/conditional requests alongside complete-text traffic.
-The default smoke wave does not saturate the new 64-slot profile. The probe uses CFG 2.5 / temperature 0.7 / top-k 80 and eager,
-synchronous scheduling. Successful completion checks output routing and lifecycle;
-it does not establish waveform/text quality, numerical parity, or throughput.
-
-### Experimental mixed CFG/conditional admission
-
-[`deploy/easymagpie_cfg_concurrent.yaml`](deploy/easymagpie_cfg_concurrent.yaml)
-selects the same `easymagpie_cfg` pipeline with 64 physical Stage-0 slots and 32
-public Stage-1 slots. CFG consumes two physical slots, conditional-only consumes
-one, and private branches never transfer codec payloads. Set `use_cfg=False` for
-conditional-only requests in this pipeline, including HTTP/WebSocket requests.
+The same `easymagpie_cfg.yaml` deployment supports mixed CFG/conditional traffic
+with 64 physical Stage-0 slots and 32 public Stage-1 slots. CFG consumes two physical
+slots, conditional-only consumes one, and private branches never transfer codec
+payloads. Set `use_cfg=False` for conditional-only direct requests or `use_cfg: false`
+in HTTP/WebSocket `extra_params`.
 
 The native codec scheduler bounds active streams by Stage 1's `max_num_seqs`
 (or a smaller configured `active_stream_window`). Excess streams wait while
@@ -592,28 +443,16 @@ token budget, or cache capacity are unavailable. A unit that cannot fit the
 total cache at all is rejected. Both branches run at aligned positions, without
 preemption or Mamba replay. Request-wide reservation trades memory utilization
 for this scheduling guarantee; lowering the output bound can increase admission
-capacity. No throughput or memory-efficiency claims have been measured.
+capacity. The benchmarks do not isolate the throughput or memory effect of this
+reservation policy.
 
 The mixed scheduler requires FCFS, Mamba cache mode `none`, and a token budget
-covering every active physical decode sequence. Keep eager synchronous execution
-and disable prefix caching/chunked prefill. CPU tests use the real hybrid cache
-allocator to check pair isolation, independent stopping, queueing under pressure,
+covering every active physical decode sequence. Scheduling remains synchronous
+with prefix caching and chunked prefill disabled, including when CUDA graphs are enabled.
+CPU tests use the real hybrid cache allocator to check pair isolation, independent stopping, queueing under pressure,
 abort/late outputs, failure cleanup, and slot reuse. They also check multiple
 guided pairs mixed with a conditional predictor row and private connector filtering.
 
-The GPU smoke probe submits six logical requests needing nine physical slots within
-the 64-slot profile, cancels one guided request, then checks another mixed wave
-using the same engine. It requires public request IDs, no reported engine errors,
-and completed codec output for every non-cancelled request:
-
-```bash
-VLLM_PLUGINS=easymagpie_omni python tools/easymagpie_vllm_omni/scripts/probe_cfg_concurrency.py \
-  --model /path/to/reconverted_v2 --speaker eng --cfg-scale 2.5 --temperature 0.7 --top-k 80 \
-  --output mixed_probe_results.json
-```
-
-Expanded-capacity guided batching passed with the compiled profile as summarized above.
-A saturated mixed CFG/conditional cancellation/lifecycle probe at the expanded capacity remains
-pending; the earlier six-slot mixed lifecycle probe and current smoke wave do not cover it.
-Neither the mixed probes nor the guided timing sweep establish waveform parity across batch sizes.
-
+The benchmark measures guided traffic rather than saturated mixed CFG/conditional
+traffic. GPU cancellation and lifecycle behavior under saturated mixed load, and
+waveform parity across batch sizes, require separate validation.

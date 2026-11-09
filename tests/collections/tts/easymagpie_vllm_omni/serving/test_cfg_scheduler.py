@@ -24,8 +24,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
-from easymagpie_vllm_omni.cfg_pairing import CFG_PAIRING_PROBE_KEY, CFGPairingError, CFGPairingTransferFilter
-from easymagpie_vllm_omni.cfg_scheduler import EasyMagpieCFGPairingScheduler, validate_cfg_pairing_config
+from easymagpie_vllm_omni.cfg_pairing import CFGPairingError, CFGPairingTransferFilter
+from easymagpie_vllm_omni.cfg_scheduler import EasyMagpieCFGScheduler, validate_cfg_config
 from vllm.config import SchedulerConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, MambaSpec
@@ -44,7 +44,7 @@ def test_allocates_separate_backbone_mamba_and_predictor_cache_histories() -> No
     """Verify allocates separate backbone mamba and predictor cache histories."""
     scheduler = _scheduler()
     scheduler.add_request(_request())
-    pair = scheduler.cfg_pair
+    pair = next(iter(scheduler.cfg_pairs.values()))
     first = scheduler.schedule()
     assert first.num_scheduled_tokens == dict.fromkeys(pair.physical_ids, 3)
     physical = {req.req_id: req for req in first.scheduled_new_reqs}
@@ -55,7 +55,7 @@ def test_allocates_separate_backbone_mamba_and_predictor_cache_histories() -> No
         assert set(cond_blocks).isdisjoint(uncond_blocks)
     for rid in pair.physical_ids:
         info = deserialize_additional_information(physical[rid].additional_information)
-        assert info == {CFG_PAIRING_PROBE_KEY: True, "speaker_id": "eng", **pair.metadata(rid)}
+        assert info == {"use_cfg": True, "speaker_id": "eng", "text_tokens": [2, 3], **pair.metadata(rid)}
     # Request-owned mutable token histories are independent.
     conditional, unconditional = (scheduler.requests[rid] for rid in pair.physical_ids)
     assert conditional._all_token_ids is not unconditional._all_token_ids
@@ -68,7 +68,7 @@ def test_allocates_separate_backbone_mamba_and_predictor_cache_histories() -> No
     assert second.num_scheduled_tokens == dict.fromkeys(pair.physical_ids, 1)
     assert second.scheduled_cached_reqs.num_computed_tokens == [3, 3]
     scheduler.update_from_output(second, _output(pair, conditional_token=1, unconditional_token=0))
-    assert scheduler.cfg_pair is None
+    assert not scheduler.cfg_pairs
     assert scheduler.requests == {}
     # Both physical identities still reach the worker cleanup notification.
     assert scheduler.schedule().finished_req_ids == set(pair.physical_ids)
@@ -80,16 +80,17 @@ def test_cfg_synthesis_requires_reconverted_artifact_and_complete_text() -> None
     config = scheduler.vllm_config.model_config.hf_config
     config.use_codec_latent_audio_embedding = True
     config.codec_num_levels_per_group = [8, 8, 16]
+    del config.cfg_capability
     info = {"use_cfg": True, "speaker_id": "eng", "text_tokens": [2, 3]}
     with pytest.raises(ValueError, match="reconvert"):
         scheduler.add_request(_request(info=info))
-    assert scheduler.requests == {} and scheduler.cfg_pair is None
+    assert scheduler.requests == {} and not scheduler.cfg_pairs
     config.cfg_capability = {"version": 1, "context_cas_disabled": False}
     config.cfg_unk_token_id = 12
     with pytest.raises(ValueError, match="complete target text"):
         scheduler.add_request(_request(info={"use_cfg": True, "speaker_id": "eng"}))
     scheduler.add_request(_request(info=info))
-    pair = scheduler.cfg_pair
+    pair = next(iter(scheduler.cfg_pairs.values()))
     assert scheduler.schedule().num_scheduled_tokens == dict.fromkeys(pair.physical_ids, 3)
 
 
@@ -100,7 +101,7 @@ def test_codec_connector_never_receives_hidden_payload_or_completion() -> None:
     # Add a transfer spy only after scheduling so native block allocation and
     # request-data construction still execute without a transport connection.
     scheduler.add_request(_request())
-    pair = scheduler.cfg_pair
+    pair = next(iter(scheduler.cfg_pairs.values()))
     step = scheduler.schedule()
     scheduler.chunk_transfer_adapter = CFGPairingTransferFilter(
         SimpleNamespace(
@@ -125,11 +126,11 @@ def test_abort_from_either_branch_frees_both_and_allows_slot_reuse(branch: str) 
     scheduler = _scheduler()
     free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     scheduler.add_request(_request())
-    pair = scheduler.cfg_pair
+    pair = next(iter(scheduler.cfg_pairs.values()))
     step = scheduler.schedule()
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() < free_before
     assert scheduler.finish_requests(getattr(pair, branch), RequestStatus.FINISHED_ABORTED) == [("speech", 0)]
-    assert scheduler.cfg_pair is None
+    assert not scheduler.cfg_pairs
     assert scheduler.requests == {}
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before
     # A late output from the cancelled step must not resurrect either history.
@@ -138,18 +139,15 @@ def test_abort_from_either_branch_frees_both_and_allows_slot_reuse(branch: str) 
     assert scheduler.schedule().total_num_scheduled_tokens == 6
 
 
-def test_partial_admission_aborts_pair_before_computed_counters_advance() -> None:
-    """Verify partial admission aborts pair before computed counters advance."""
-    scheduler = _scheduler(num_blocks=4)  # null block + one hybrid branch, not two
+def test_insufficient_cache_rejects_pair_before_admission() -> None:
+    """Reject a pair that cannot fit without allocating a partial history."""
+    scheduler = _scheduler(num_blocks=4)
     request = _request()
     free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
-    scheduler.add_request(request)
-    with pytest.raises(CFGPairingError, match="aligned"):
-        scheduler.schedule()
+    with pytest.raises(ValueError, match="cache"):
+        scheduler.add_request(request)
     assert request.num_computed_tokens == 0
-    assert scheduler.requests == {}
-    assert scheduler.running == []
-    assert not scheduler.waiting
+    assert not scheduler.requests and not scheduler.running and not scheduler.waiting
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before
 
 
@@ -173,7 +171,7 @@ def test_running_cache_pressure_rejects_preemption_without_replaying_either_bran
     scheduler = _scheduler()
     free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     scheduler.add_request(_request())
-    pair = scheduler.cfg_pair
+    pair = next(iter(scheduler.cfg_pairs.values()))
     first = scheduler.schedule()
     scheduler.update_from_output(first, _output(pair))
     conditional = scheduler.requests[pair.conditional_id]
@@ -236,7 +234,7 @@ def test_failure_admitting_second_branch_cleans_first_and_restores_public_metada
         scheduler.add_request(request)
     assert not scheduler.requests
     assert not scheduler.waiting
-    assert scheduler.cfg_pair is None
+    assert not scheduler.cfg_pairs
     assert request.additional_information is info
 
 
@@ -249,7 +247,7 @@ def test_runner_failure_cleans_both_histories(monkeypatch: pytest.MonkeyPatch) -
     scheduler = _scheduler()
     free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     scheduler.add_request(_request())
-    pair = scheduler.cfg_pair
+    pair = next(iter(scheduler.cfg_pairs.values()))
     step = scheduler.schedule()
 
     def fail_output(self, *args: Any) -> None:
@@ -267,35 +265,36 @@ def test_runner_failure_cleans_both_histories(monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(RuntimeError, match="output failed"):
         scheduler.update_from_output(step, _output(pair))
     assert not scheduler.requests
-    assert scheduler.cfg_pair is None
+    assert not scheduler.cfg_pairs
     assert scheduler._cfg_step_pending is False
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before
 
 
-def test_pair_rejects_resumable_and_unmarked_or_full_cfg_requests_before_admission() -> None:
-    """Verify pair rejects resumable and unmarked or full CFG requests before admission."""
+def test_cfg_rejects_incomplete_text_obsolete_probe_and_unbounded_stream() -> None:
+    """Reject unsupported inputs before admitting any physical histories."""
     scheduler = _scheduler()
     requests = [
         _request(info={"speaker_id": "eng"}),
-        _request(info={"speaker_id": "eng", CFG_PAIRING_PROBE_KEY: True, "use_cfg": True}),
+        _request(info={"speaker_id": "eng", "_cfg_pairing_probe": True, "use_cfg": True}),
         _request(resumable=True),
     ]
     for request in requests:
         with pytest.raises(ValueError):
             scheduler.add_request(request)
-        assert scheduler.cfg_pair is None
+        assert not scheduler.cfg_pairs
         assert scheduler.requests == {}
 
 
-def test_pair_rejects_long_prompts_and_another_logical_request() -> None:
-    """Verify pair rejects long prompts and another logical request."""
+def test_pair_rejects_long_prompts_and_queues_another_logical_request() -> None:
+    """Reject oversized prompts but allow another logical request to queue."""
     scheduler = _scheduler()
     with pytest.raises(ValueError, match="token budget"):
         scheduler.add_request(_request(prompt=[0] * 65))
     scheduler.add_request(_request())
-    with pytest.raises(CFGPairingError, match="one logical"):
-        scheduler.add_request(_request("another"))
-    assert len(scheduler.requests) == 2
+    scheduler.add_request(_request("another"))
+    assert len(scheduler.requests) == 4
+    assert scheduler.schedule().num_scheduled_tokens == dict.fromkeys(scheduler.cfg_pairs["speech"].physical_ids, 3)
+    assert len(scheduler.waiting) == 2
 
 
 @pytest.mark.parametrize(
@@ -310,12 +309,12 @@ def test_pair_rejects_long_prompts_and_another_logical_request() -> None:
         ("parallel_config", "pipeline_parallel_size", 2),
     ],
 )
-def test_probe_validates_unsupported_execution_modes(
+def test_cfg_validates_unsupported_execution_modes(
     section: str,
     key: str,
     value: object,
 ) -> None:
-    """Verify probe validates unsupported execution modes.
+    """Verify CFG validates unsupported execution modes.
 
     Args:
         section: Configuration section to modify.
@@ -324,8 +323,8 @@ def test_probe_validates_unsupported_execution_modes(
     """
     config = _config()
     setattr(getattr(config, section), key, value)
-    with pytest.raises(ValueError, match="CFG pairing probe"):
-        validate_cfg_pairing_config(config)
+    with pytest.raises(ValueError, match="CFG synthesis"):
+        validate_cfg_config(config)
 
 
 def _config(num_blocks: int = 64) -> SimpleNamespace:
@@ -374,14 +373,14 @@ def _config(num_blocks: int = 64) -> SimpleNamespace:
     )
 
 
-def _scheduler(num_blocks: int = 64) -> EasyMagpieCFGPairingScheduler:
-    """Construct the paired diagnostic scheduler with a real test cache allocator.
+def _scheduler(num_blocks: int = 64) -> EasyMagpieCFGScheduler:
+    """Construct the CFG synthesis scheduler with a real test cache allocator.
 
     Args:
         num_blocks: Number of available cache blocks.
 
     Returns:
-        The paired diagnostic scheduler using the configured test cache.
+        The CFG synthesis scheduler using the configured test cache.
     """
     attention = FullAttentionSpec(block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32)
     mamba = MambaSpec(block_size=4, shapes=((8,),), dtypes=(torch.float32,), mamba_cache_mode="none")
@@ -395,8 +394,13 @@ def _scheduler(num_blocks: int = 64) -> EasyMagpieCFGPairingScheduler:
             KVCacheGroupSpec(["backbone.mamba"], mamba),
         ],
     )
-    return EasyMagpieCFGPairingScheduler(
-        vllm_config=_config(num_blocks),
+    config = _config(num_blocks)
+    config.model_config.hf_config.use_codec_latent_audio_embedding = True
+    config.model_config.hf_config.codec_num_levels_per_group = [8, 8, 16]
+    config.model_config.hf_config.cfg_capability = {"version": 1, "context_cas_disabled": False}
+    config.model_config.hf_config.cfg_unk_token_id = 12
+    return EasyMagpieCFGScheduler(
+        vllm_config=config,
         kv_cache_config=caches,
         structured_output_manager=SimpleNamespace(should_advance=lambda request: False),
         block_size=4,
@@ -430,7 +434,7 @@ def _request(
         pooling_params=None,
         resumable=resumable,
         additional_information=serialize_additional_information(
-            {CFG_PAIRING_PROBE_KEY: True, "speaker_id": "eng"} if info is None else info
+            {"use_cfg": True, "speaker_id": "eng", "text_tokens": [2, 3]} if info is None else info
         ),
     )
 

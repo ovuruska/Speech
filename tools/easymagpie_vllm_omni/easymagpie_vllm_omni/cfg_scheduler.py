@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Synchronous V2 CFG scheduling and the restricted cache-pairing diagnostic."""
+"""Synchronous V2 CFG/conditional scheduling with paired cache ownership."""
 from __future__ import annotations
 
 import copy
@@ -23,7 +23,6 @@ from easymagpie_vllm_omni.cfg import AcousticSamplingSettings
 from easymagpie_vllm_omni.cfg_graph import supports_cfg_graphs
 from easymagpie_vllm_omni.cfg_pairing import (
     CFG_PAIR_METADATA_KEY,
-    CFG_PAIRING_PROBE_KEY,
     CFGPair,
     CFGPairingError,
     CFGPairingTransferFilter,
@@ -48,42 +47,30 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request, StreamingUpdate
 
 
-class EasyMagpieCFGPairingScheduler(OmniARScheduler):
+class _CFGHistoryScheduler(OmniARScheduler):
     """Allocate real engine histories for two branches and expose one logical output.
 
-    Admission is limited to one non-resumable, known-speaker request. Insufficient
-    cache capacity or a split step aborts both branches before worker execution;
-    this diagnostic deliberately does not preempt or replay Mamba state.
+    Shared cache ownership, feedback, and cleanup for CFG synthesis. The concrete
+    scheduler supplies whole-request reservation and streaming admission.
     """
-
-    single_request = True
 
     def __init__(
         self,
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        """Initialize EasyMagpieCFGPairingScheduler state.
+        """Initialize _CFGHistoryScheduler state.
 
         Args:
             *args: Positional arguments forwarded to the base scheduler implementation.
             **kwargs: Keyword arguments forwarded to the base scheduler implementation.
         """
         super().__init__(*args, **kwargs)
-        validate_cfg_pairing_config(self.vllm_config, allow_decode_graphs=not self.single_request)
+        validate_cfg_config(self.vllm_config)
         self.cfg_pairs: dict[str, CFGPair] = {}
         self._cfg_step_pending = False
         if self.chunk_transfer_adapter is not None:
             self.chunk_transfer_adapter = CFGPairingTransferFilter(self.chunk_transfer_adapter)
-
-    @property
-    def cfg_pair(self) -> CFGPair | None:
-        """The diagnostic's sole pair; mixed scheduling uses cfg_pairs explicitly.
-
-        Returns:
-            The diagnostic scheduler's current pair, or None when no pair is live.
-        """
-        return next(iter(self.cfg_pairs.values()), None)
 
     def add_request(self, request: OmniRequest) -> None:
         """Admit a logical request and allocate its physical CFG histories.
@@ -95,13 +82,9 @@ class EasyMagpieCFGPairingScheduler(OmniARScheduler):
             CFGPairingError: If the input or engine state violates the supported contract.
             ValueError: If the input or engine state violates the supported contract.
         """
-        if self.single_request and self.cfg_pairs:
-            raise CFGPairingError("CFG pairing probe accepts only one logical request at a time")
         info = deserialize_additional_information(request.additional_information)
         settings = AcousticSamplingSettings.from_info(info)
-        _validate_probe_request(
-            request, info, self.max_num_scheduled_tokens, allow_conditional=not self.single_request
-        )
+        _validate_cfg_request(request, info, self.max_num_scheduled_tokens)
         if request.request_id in self.requests:
             raise ValueError("Duplicate logical request ID")
         if settings.use_cfg:
@@ -112,7 +95,7 @@ class EasyMagpieCFGPairingScheduler(OmniARScheduler):
                 )
             if not request.resumable and (info.get("text_token") or not (info.get("text") or info.get("text_tokens"))):
                 raise ValueError("Initial CFG synthesis requires complete target text")
-        if not settings.use_cfg and info.get(CFG_PAIRING_PROBE_KEY) is not True:
+        if not settings.use_cfg:
             self._validate_reservation([request])
             super().add_request(request)
             return
@@ -134,8 +117,7 @@ class EasyMagpieCFGPairingScheduler(OmniARScheduler):
         )
         if hasattr(request, "_cfg_reservation_tokens"):
             shadow._cfg_reservation_tokens = request._cfg_reservation_tokens
-        if not self.single_request:
-            self._validate_reservation([request, shadow])
+        self._validate_reservation([request, shadow])
         original_info = request.additional_information
         request.additional_information = serialize_additional_information(
             {**info, **pair.metadata(pair.conditional_id)}
@@ -171,8 +153,7 @@ class EasyMagpieCFGPairingScheduler(OmniARScheduler):
         try:
             waiting = self.waiting
             try:
-                if not self.single_request:
-                    self.waiting = self._admit_waiting_units()
+                self.waiting = self._admit_waiting_units()
                 return super().schedule(*args, **kwargs)
             finally:
                 if self.waiting is not waiting:
@@ -287,15 +268,13 @@ class EasyMagpieCFGPairingScheduler(OmniARScheduler):
         return [(rid, client) for rid, client in result if not is_cfg_hidden_id(rid)]
 
 
-class EasyMagpieCFGScheduler(EasyMagpieCFGPairingScheduler):
+class EasyMagpieCFGScheduler(_CFGHistoryScheduler):
     """FCFS mixed CFG/conditional requests with whole-request cache reservation.
 
     A logical unit needs two sequence slots for CFG and one otherwise. Reserve
     its entire bounded history before admission so decode never needs preemption.
     This trades cache utilization for safe Mamba ownership and bounded scheduling.
     """
-
-    single_request = False
 
     def __init__(
         self,
@@ -641,16 +620,11 @@ class EasyMagpieCFGScheduler(EasyMagpieCFGPairingScheduler):
         return admitted
 
 
-def validate_cfg_pairing_config(
-    config: VllmConfig,
-    *,
-    allow_decode_graphs: bool = False,
-) -> None:
-    """Fail at startup when the cache probe's execution assumptions do not hold.
+def validate_cfg_config(config: VllmConfig) -> None:
+    """Fail at startup when CFG synthesis execution assumptions do not hold.
 
     Args:
         config: Engine configuration to validate or inspect.
-        allow_decode_graphs: Whether validated synthesis graph policies are permitted.
 
     Raises:
         ValueError: If execution, model, or cache settings cannot safely support paired histories.
@@ -659,8 +633,7 @@ def validate_cfg_pairing_config(
     parallel = config.parallel_config
     compilation = getattr(config, "compilation_config", None)
     decode_graphs = (
-        allow_decode_graphs
-        and getattr(model.hf_config, "acoustic_predictor_type", None) == "acoustic_codes_predictor"
+        getattr(model.hf_config, "acoustic_predictor_type", None) == "acoustic_codes_predictor"
         and getattr(model.hf_config, "cfg_capability", None) is not None
         and supports_cfg_graphs(compilation)
     )
@@ -674,46 +647,36 @@ def validate_cfg_pairing_config(
         or config.speculative_config is not None
     ):
         raise ValueError(
-            "CFG pairing probe requires eager (or synthesis-only FULL_DECODE_ONLY without compilation / "
+            "CFG synthesis requires eager (or FULL_DECODE_ONLY without compilation / "
             "FULL_AND_PIECEWISE with VLLM_COMPILE), "
             "synchronous, unchunked execution, no prefix cache or TP/PP"
         )
     if scheduler.max_num_seqs < 2 or scheduler.max_num_batched_tokens < 2:
-        raise ValueError("CFG pairing probe requires capacity for two physical sequences")
+        raise ValueError("CFG synthesis requires capacity for two physical sequences")
     if getattr(model.hf_config, "acoustic_predictor_type", None) != "acoustic_codes_predictor":
-        raise ValueError("CFG pairing probe requires the V2 acoustic predictor")
+        raise ValueError("CFG synthesis requires the V2 acoustic predictor")
     if config.kv_transfer_config is not None or config.ec_transfer_config is not None:
-        raise ValueError("CFG pairing probe does not support distributed cache transfer")
+        raise ValueError("CFG synthesis does not support distributed cache transfer")
 
 
-def _validate_probe_request(
-    request: Request,
-    info: dict[str, Any],
-    token_budget: int,
-    *,
-    allow_conditional: bool = False,
-) -> None:
-    """Validate supported text inputs before allocating paired cache histories.
+def _validate_cfg_request(request: Request, info: dict[str, Any], token_budget: int) -> None:
+    """Validate registered-speaker text inputs before allocating cache histories.
 
     Args:
         request: Incoming engine request.
         info: Additional request metadata.
         token_budget: Maximum scheduled tokens per model step.
-        allow_conditional: Whether to admit ordinary conditional requests alongside CFG requests.
 
     Raises:
-        ValueError: If the request uses unsupported model state, text input, or token budgets.
+        ValueError: If request inputs or token budgets are unsupported.
     """
+    if "_cfg_pairing_probe" in info:
+        raise ValueError("_cfg_pairing_probe is no longer supported; use use_cfg to select guided synthesis")
     settings = AcousticSamplingSettings.from_info(info)
-    if not allow_conditional and info.get(CFG_PAIRING_PROBE_KEY) is not True and not settings.use_cfg:
-        raise ValueError("Set _cfg_pairing_probe=true for the cache probe, or use_cfg=true for guided synthesis")
-    if settings.use_cfg and info.get(CFG_PAIRING_PROBE_KEY):
-        raise ValueError("Choose either _cfg_pairing_probe or use_cfg")
     if CFG_PAIR_METADATA_KEY in info or is_cfg_hidden_id(request.request_id):
         raise ValueError("CFG branch identity is reserved for the scheduler")
     if (
-        (request.resumable and (not allow_conditional or info.get(CFG_PAIRING_PROBE_KEY)))
-        or request.mm_features
+        request.mm_features
         or request.prompt_embeds is not None
         or request.lora_request is not None
         or request.pooling_params is not None
@@ -721,17 +684,12 @@ def _validate_probe_request(
         or request.kv_transfer_params
         or not info.get("speaker_id")
     ):
-        raise ValueError("CFG pairing probe requires non-resumable known-speaker text input without extra model state")
-    if (
-        allow_conditional
-        and not request.resumable
-        and (info.get("text_token") or not (info.get("text") or info.get("text_tokens")))
-    ):
-        if info.get(CFG_PAIRING_PROBE_KEY) is not True:
-            raise ValueError("Mixed CFG scheduling requires complete target text")
-    branches = 2 if settings.use_cfg or info.get(CFG_PAIRING_PROBE_KEY) is True else 1
+        raise ValueError("CFG synthesis requires known-speaker text input without extra model state")
+    if not request.resumable and (info.get("text_token") or not (info.get("text") or info.get("text_tokens"))):
+        raise ValueError("CFG scheduling requires complete target text")
+    branches = 2 if settings.use_cfg else 1
     if not request.prompt_token_ids or branches * len(request.prompt_token_ids) > token_budget:
-        raise ValueError("CFG pairing probe token budget must fit both complete prompts in one step")
+        raise ValueError("CFG token budget must fit all branch prompts in one step")
 
 
 @dataclass

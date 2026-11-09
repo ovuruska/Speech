@@ -1,5 +1,4 @@
-# V2 CFG synthesis: match the standard profile's 32 logical requests.
-# Each guided request owns two physical Stage-0 histories; validate GPU capacity.
+# Experimental compiled backbone prefill plus full V2 CFG decode graphs.
 pipeline: easymagpie_cfg
 async_chunk: true
 trust_remote_code: true
@@ -21,7 +20,14 @@ stages:
     # Match 32 standard logical requests; CFG consumes two physical sequences.
     max_num_seqs: 64
     gpu_memory_utilization: 0.5
-    enforce_eager: true
+    enforce_eager: false
+    compilation_config:
+      mode: 3  # CompilationMode.VLLM_COMPILE: compile the Nemotron-H backbone.
+      cudagraph_mode: FULL_AND_PIECEWISE
+      # Sizes count physical tokens: paired prefill needs both prompt spans.
+      # Only sizes <= max_num_seqs are used for full decode capture.
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+      max_cudagraph_capture_size: 512
     async_scheduling: false
     enable_prefix_caching: false
     enable_chunked_prefill: false
@@ -50,7 +56,6 @@ stages:
     async_scheduling: false
     enable_prefix_caching: false
     enable_chunked_prefill: false
-    # The runner retains cumulative codec prompt IDs across streaming chunks.
     # Cover the complete Stage-0 generation budget, not just one codec chunk.
     max_num_batched_tokens: 2048
     max_model_len: 2048

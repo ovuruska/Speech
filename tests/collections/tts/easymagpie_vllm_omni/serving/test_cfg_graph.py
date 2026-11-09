@@ -154,13 +154,13 @@ def test_cuda_graph_replay_updates_pairing_and_settings_without_recapture() -> N
 
 
 @pytest.mark.parametrize("compiled_prefill", [False, True])
-def test_graph_guard_is_opt_in_and_keeps_diagnostic_and_async_restrictions(compiled_prefill: bool) -> None:
-    """Verify graph guard is opt in and keeps diagnostic and async restrictions.
+def test_graph_guard_accepts_supported_policies_and_rejects_async(compiled_prefill: bool) -> None:
+    """Verify supported graph policies retain synchronous execution restrictions.
 
     Args:
         compiled_prefill: Whether to use compiled piecewise prefill.
     """
-    from easymagpie_vllm_omni.cfg_scheduler import validate_cfg_pairing_config
+    from easymagpie_vllm_omni.cfg_scheduler import validate_cfg_config
     from test_cfg_scheduler import _config
     from vllm.config import CompilationMode, CUDAGraphMode
 
@@ -171,19 +171,17 @@ def test_graph_guard_is_opt_in_and_keeps_diagnostic_and_async_restrictions(compi
         mode=CompilationMode.VLLM_COMPILE if compiled_prefill else CompilationMode.NONE,
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE if compiled_prefill else CUDAGraphMode.FULL_DECODE_ONLY,
     )
-    with pytest.raises(ValueError, match="CFG pairing probe"):
-        validate_cfg_pairing_config(config)
-    validate_cfg_pairing_config(config, allow_decode_graphs=True)
+    validate_cfg_config(config)
     for mode in [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE]:
         config.compilation_config.cudagraph_mode = mode
-        with pytest.raises(ValueError, match="CFG pairing probe"):
-            validate_cfg_pairing_config(config, allow_decode_graphs=True)
+        with pytest.raises(ValueError, match="CFG synthesis"):
+            validate_cfg_config(config)
     config.compilation_config.cudagraph_mode = (
         CUDAGraphMode.FULL_AND_PIECEWISE if compiled_prefill else CUDAGraphMode.FULL_DECODE_ONLY
     )
     config.scheduler_config.async_scheduling = True
-    with pytest.raises(ValueError, match="CFG pairing probe"):
-        validate_cfg_pairing_config(config, allow_decode_graphs=True)
+    with pytest.raises(ValueError, match="CFG synthesis"):
+        validate_cfg_config(config)
 
 
 @pytest.mark.parametrize("compiled_prefill", [False, True])
@@ -194,7 +192,7 @@ def test_graph_guard_rejects_mismatched_compilation_policy(compiled_prefill: boo
         compiled_prefill: Whether to use compiled piecewise prefill.
     """
     from easymagpie_vllm_omni.cfg_graph import uses_cfg_decode_graphs
-    from easymagpie_vllm_omni.cfg_scheduler import validate_cfg_pairing_config
+    from easymagpie_vllm_omni.cfg_scheduler import validate_cfg_config
     from test_cfg_scheduler import _config
     from vllm.config import CompilationMode, CUDAGraphMode
 
@@ -206,8 +204,8 @@ def test_graph_guard_rejects_mismatched_compilation_policy(compiled_prefill: boo
         mode=CompilationMode.VLLM_COMPILE if compiled_prefill else CompilationMode.NONE,
         cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY if compiled_prefill else CUDAGraphMode.FULL_AND_PIECEWISE,
     )
-    with pytest.raises(ValueError, match="CFG pairing probe"):
-        validate_cfg_pairing_config(config, allow_decode_graphs=True)
+    with pytest.raises(ValueError, match="CFG synthesis"):
+        validate_cfg_config(config)
     assert not uses_cfg_decode_graphs(config)
 
 
@@ -398,25 +396,26 @@ def test_padded_paired_prefill_preserves_distinct_embeddings_and_only_advances_c
     assert not model._sample_stop.any()
 
 
-def test_graph_profile_parses_decode_only_configuration_and_keeps_codec_eager() -> None:
-    """Verify graph profile parses decode only configuration and keeps codec eager."""
+def test_cfg_profile_parses_compiled_configuration_and_keeps_codec_eager() -> None:
+    """Verify CFG profile enables compiled graphs while keeping the codec eager."""
     from pathlib import Path
 
     import yaml
     from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
 
     root = Path(__file__).resolve().parents[5] / "tools/easymagpie_vllm_omni"
-    graph = yaml.safe_load((root / "deploy/easymagpie_cfg_graph.yaml").read_text())
-    eager = yaml.safe_load((root / "deploy/easymagpie_cfg.yaml").read_text())
+    graph = yaml.safe_load((root / "deploy/easymagpie_cfg.yaml").read_text())
     stage = graph["stages"][0]
     config = CompilationConfig(**stage["compilation_config"])
-    assert config.mode == CompilationMode.NONE
-    assert config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
-    assert config.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64]
+    assert config.mode == CompilationMode.VLLM_COMPILE
+    assert config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+    assert config.cudagraph_capture_sizes == [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    assert config.max_cudagraph_capture_size == 512
     assert stage["enforce_eager"] is False
     assert stage["async_scheduling"] is False
-    assert graph["dtype"] == eager["dtype"] == "float16"
-    assert graph["stages"][1] == eager["stages"][1]
+    assert graph["dtype"] == "float16"
+    assert graph["stages"][1]["enforce_eager"] is True
+    assert graph["stages"][1]["dtype"] == "float32"
 
 
 @pytest.mark.parametrize("compiled_prefill", [False, True])
@@ -441,7 +440,6 @@ def test_fixed_shape_activation_is_scoped_to_paired_synthesis(compiled_prefill: 
     for scheduler in [
         None,
         "easymagpie_vllm_omni.scheduler.EasyMagpieARAsyncScheduler",
-        "easymagpie_vllm_omni.cfg_scheduler.EasyMagpieCFGPairingScheduler",
     ]:
         config.scheduler_config.scheduler_cls = scheduler
         assert not uses_cfg_decode_graphs(config)
@@ -452,18 +450,13 @@ def test_compiled_profile_dispatches_prefill_piecewise_and_decode_full() -> None
     import yaml
     from conftest import EASYMAGPIE_ROOT
     from easymagpie_vllm_omni.cfg_graph import uses_cfg_decode_graphs
-    from easymagpie_vllm_omni.cfg_scheduler import validate_cfg_pairing_config
+    from easymagpie_vllm_omni.cfg_scheduler import validate_cfg_config
     from test_cfg_scheduler import _config
     from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
     from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 
-    profile = yaml.safe_load((EASYMAGPIE_ROOT / "deploy/easymagpie_cfg_compile.yaml").read_text())
-    fallback = yaml.safe_load((EASYMAGPIE_ROOT / "deploy/easymagpie_cfg_graph.yaml").read_text())
+    profile = yaml.safe_load((EASYMAGPIE_ROOT / "deploy/easymagpie_cfg.yaml").read_text())
     stage = profile["stages"][0]
-    assert profile["stages"][1] == fallback["stages"][1]
-    assert {k: v for k, v in stage.items() if k != "compilation_config"} == {
-        k: v for k, v in fallback["stages"][0].items() if k != "compilation_config"
-    }
     compilation = CompilationConfig(**stage["compilation_config"])
     assert compilation.mode == CompilationMode.VLLM_COMPILE
     assert compilation.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
@@ -478,7 +471,7 @@ def test_compiled_profile_dispatches_prefill_piecewise_and_decode_full() -> None
     config.scheduler_config.max_num_seqs = stage["max_num_seqs"]
     config.num_speculative_tokens = 0
     config.lora_config = None
-    validate_cfg_pairing_config(config, allow_decode_graphs=True)
+    validate_cfg_config(config)
     assert uses_cfg_decode_graphs(config)
     dispatcher = CudagraphDispatcher(config)
     dispatcher.initialize_cudagraph_keys(compilation.cudagraph_mode)

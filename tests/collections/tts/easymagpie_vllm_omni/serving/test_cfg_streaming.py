@@ -22,7 +22,7 @@ def test_registered_speaker_cfg_stream_waits_and_resumes_both_histories() -> Non
     """Verify registered speaker CFG stream waits and resumes both histories."""
     scheduler = _mixed_scheduler()
     scheduler.add_request(_chunk(initial=True))
-    pair = scheduler.cfg_pair
+    pair = next(iter(scheduler.cfg_pairs.values()))
     first = scheduler.schedule()
     assert first.num_scheduled_tokens == dict.fromkeys(pair.physical_ids, 3)
     scheduler.update_from_output(first, _batch_output(first))
@@ -53,7 +53,7 @@ def test_stream_final_sentinel_completes_both_branches_and_allows_reuse(queued: 
     scheduler = _mixed_scheduler()
     free = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     scheduler.add_request(_chunk(initial=True))
-    pair = scheduler.cfg_pair
+    pair = next(iter(scheduler.cfg_pairs.values()))
     if queued:
         scheduler.add_request(_chunk())
         final = _chunk()
