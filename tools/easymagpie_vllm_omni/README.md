@@ -67,6 +67,11 @@ better kernels; for an explicit sweep, run `python scripts/tune_mamba_ssu.py --m
 See the [`offline_demo.ipynb`](../../tutorials/tts/easymagpie_vllm_omni/offline_demo.ipynb) tutorial to check how
 `AsyncOmni` is initialized and used.
 
+### Classifier-free guidance (CFG)
+
+See the [V2 CFG guide](README_CFG.md) for guided synthesis, deployment profiles,
+CUDA graphs, HTTP/WebSocket usage, benchmarks, and validation.
+
 ### Request-time reference and user audio
 
 Every source EasyMagpie NeMo checkpoint contains the codec encoder and
@@ -225,3 +230,12 @@ python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 1 32 \
 python scripts/benchmark_incremental_server.py --model ./converted_model \
     --text-file vctk_subset.txt --tokens-per-chunk 5 -n 128 -c 1 32
 ```
+
+### V2 default acoustic sampling
+
+Temperature 0.7 / top-k 80 use the original exact-k, frame-level Gumbel sampling
+recipe. When CFG is enabled, its default scale 2.5 is also a shared constant.
+Other per-request settings remain supported through a batch-wide eager fallback;
+default batches use the configured graph policy. This changes RNG consumption and
+cutoff-tie behavior for default requests. See
+[sampling and fallback details](README_CFG.md#shared-default-sampling-and-per-request-fallback).
